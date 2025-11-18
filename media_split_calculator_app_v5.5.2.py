@@ -37,6 +37,14 @@ def ensure_mode():
     st.session_state.setdefault('cat_level1', [])
     st.session_state.setdefault('cat_level2', [])
     st.session_state.setdefault('cat_level3', [])
+    st.session_state.setdefault('total_budget_cache', 240.0)
+    st.session_state.setdefault('alpha_cache', 1.6)
+    st.session_state.setdefault('beta_cache', 1.0)
+    st.session_state.setdefault('other_share_cache', 10.0)
+    for key in ['y_min','y_max','da_min','da_max','vk_min','vk_max','mts_min','mts_max']:
+        st.session_state.setdefault(key, 0.0)
+    st.session_state.setdefault('last_summary_message', None)
+    st.session_state.setdefault('last_margin_message', None)
 
 def ensure_stable_ids(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -76,6 +84,60 @@ UI_GROUPS = {
     "Direct": ["Direct", "РСЯ"],
 }
 
+CATEGORY_ALIAS = {
+    "soc": "social",
+    "smm": "social",
+    "social media": "social",
+    "socialmedia": "social",
+    "social-media": "social",
+    "соц": "social",
+    "социальные сети": "social",
+    "tg": "tg",
+    "telegram": "tg",
+    "telegram ads": "tg",
+    "telegram-ads": "tg",
+    "телеграм": "tg",
+    "тг": "tg",
+}
+
+CARD_STYLE = (
+    "background-color: rgba(255,255,255,0.05); padding: 24px 28px; "
+    "border-radius: 12px; border: 1px solid rgba(255,255,255,0.08); "
+    "box-shadow: 0 8px 24px rgba(0,0,0,0.35);"
+)
+
+
+def normalize_category_key(value) -> str:
+    key = _norm_text(value)
+    if not key:
+        return key
+    if key in CATEGORY_ALIAS:
+        return CATEGORY_ALIAS[key]
+    if "social" in key:
+        return "social"
+    if "tg" == key or key.startswith("tg ") or "telegram" in key:
+        return "tg"
+    return key
+
+
+def format_summary_banner(total_loaded, total_budget, other_share):
+    total_budget = float(total_budget) if total_budget is not None else 0.0
+    pct = (total_loaded / total_budget * 100.0) if total_budget else 100.0
+    other_share = float(other_share)
+    return (
+        f"✅ Бюджет успешно распределён: {total_loaded:.2f} млн ₽ "
+        f"({pct:.0f}%), Free Float Share ({other_share:.0f}%)"
+    )
+
+
+def format_margin_message(total_margin):
+    return f"### 💰 Общая маржинальность сплита: **{float(total_margin):.2f}%**"
+
+
+def remember_status_banners(total_loaded, total_budget, other_share, total_margin):
+    st.session_state['last_summary_message'] = format_summary_banner(total_loaded, total_budget, other_share)
+    st.session_state['last_margin_message'] = format_margin_message(total_margin)
+
 
 def get_selected_ui_groups():
     """
@@ -108,7 +170,7 @@ def filter_by_categories(df, picked_ui_groups):
     Возвращает:
       df2, order_map (для сортировки в do_recalc)
     """
-    cats_lower = df["category"].astype(str).str.lower()
+    cats_lower = df["category"].astype(str).map(normalize_category_key)
 
     # 1) Новый режим: три уровня приоритетов
     lvl1 = st.session_state.get("cat_level1", []) or []
@@ -121,7 +183,8 @@ def filter_by_categories(df, picked_ui_groups):
         for level, groups in [(1, lvl1), (2, lvl2), (3, lvl3)]:
             for group in groups:
                 for real in UI_GROUPS.get(group, [group]):
-                    level_map[real.lower()] = level
+                    norm_real = normalize_category_key(real)
+                    level_map[norm_real] = level
 
         if not level_map:
             return df.copy(), None
@@ -140,10 +203,10 @@ def filter_by_categories(df, picked_ui_groups):
     if not picked:
         return df.copy(), None
 
-    picked_lower = [c.lower() for c in picked]
+    picked_lower = [normalize_category_key(c) for c in picked]
     mask = cats_lower.isin(picked_lower) | (cats_lower == "other")
     df2 = df[mask].copy()
-    order_map = {c.lower(): i for i, c in enumerate(picked, start=1)}
+    order_map = {normalize_category_key(c): i for i, c in enumerate(picked, start=1)}
     order_map["other"] = len(picked) + 1
     return df2, order_map
 
@@ -165,10 +228,25 @@ def apply_platform_bounds(df, bounds):
 
 def _ensure_other_summary(summary_df, other_budget):
     try:
-        if other_budget is None: return summary_df
-        cats = summary_df['category'].astype(str).str.lower()
-        if 'other' not in set(cats):
-            extra = pd.DataFrame([{'category':'other','recommended budget':float(other_budget)}])
+        if summary_df is None or summary_df.empty:
+            if other_budget is None:
+                return summary_df
+            return pd.DataFrame([{'category': 'other', 'recommended budget': float(other_budget)}])
+
+        summary_df = summary_df.copy()
+        cats = summary_df['category'].astype(str).map(normalize_category_key)
+        mask = cats == 'other'
+        if mask.any():
+            total_other = pd.to_numeric(
+                seriesize(summary_df.loc[mask, 'recommended budget'], mask.sum()), errors='coerce'
+            ).fillna(0).sum()
+            merged = pd.DataFrame([
+                {'category': 'other', 'recommended budget': float(total_other)}
+            ])
+            remainder = summary_df.loc[~mask].copy()
+            summary_df = pd.concat([remainder, merged], ignore_index=True)
+        elif other_budget is not None:
+            extra = pd.DataFrame([{'category': 'other', 'recommended budget': float(other_budget)}])
             summary_df = pd.concat([summary_df, extra], ignore_index=True)
         return summary_df
     except Exception:
@@ -184,12 +262,17 @@ def allocate_budget(df, total_budget=240.0, alpha=1.6, beta=1.0, other_share=10.
     df['minimum spend']       = _series_or_default(df, 'minimum spend',       0.0)
     df['maximum spend']       = _series_or_default(df, 'maximum spend',       1e9)
 
-    other_mask   = df['category'].astype(str).str.lower()=='other'
+    other_mask   = df['category'].astype(str).map(normalize_category_key)=='other'
     other_budget = float(total_budget)*(float(other_share)/100.0)
     main_budget  = float(total_budget)-other_budget
 
     use_gates = bool((df['category priority'].notna().any() or df['placement priority'].notna().any())) if use_gates is None else use_gates
-    gate_mask = (df['category priority']<=3) & (df['placement priority']<=2) if use_gates else True
+    if use_gates:
+        cat_gate = df['category priority']<=3
+        free_gate = df['category priority']>=4
+        gate_mask = ((cat_gate & (df['placement priority']<=2)) | free_gate)
+    else:
+        gate_mask = True
 
     df_main = df[gate_mask & (~other_mask)].copy()
     if df_main.empty:
@@ -279,15 +362,15 @@ def apply_category_priorities(df, picked_ui_groups):
         for level, groups in [(1, lvl1), (2, lvl2), (3, lvl3)]:
             for group in groups:
                 for real in UI_GROUPS.get(group, [group]):
-                    key = real.lower()
+                    key = normalize_category_key(real)
                     mapping[key] = min(mapping.get(key, level), level)
     else:
         # Legacy: используем cat_order / picked_ui_groups как линейный порядок
         order = st.session_state.get("cat_order", []) or picked_ui_groups or []
         if order:
-            mapping = {c.lower(): i for i, c in enumerate(order, start=1)}
+            mapping = {normalize_category_key(c): i for i, c in enumerate(order, start=1)}
 
-    mapped = df["category"].astype(str).str.lower().map(mapping)
+    mapped = df["category"].astype(str).map(normalize_category_key).map(mapping)
     if "category priority" in df.columns:
         fallback = pd.to_numeric(
             seriesize(df["category priority"], len(df)), errors="coerce"
@@ -386,23 +469,23 @@ def do_recalc():
         use_gates=None
     )
     if order_map and 'category' in df_res:
-        df_res['_ord'] = df_res['category'].astype(str).str.lower().map(order_map).fillna(1e6)
+        df_res['_ord'] = df_res['category'].astype(str).map(normalize_category_key).map(order_map).fillna(1e6)
         df_res = df_res.sort_values(by=['_ord','recommended budget'], ascending=[True, False]).drop(columns=['_ord'])
     st.session_state.df_result = df_res.copy()
     st.session_state.summary = summary.copy()
     st.session_state.total_margin = float(total_margin)
     st.session_state.base_df = ensure_stable_ids(df_res.copy())
     st.session_state._pending_recalc = False
+    total_loaded = float(pd.to_numeric(seriesize(df_res.get('recommended budget'), len(df_res)), errors='coerce').fillna(0).sum())
+    tb = float(st.session_state.get('total_budget_cache', total_loaded))
+    other = float(st.session_state.get('other_share_cache', 10.0))
+    remember_status_banners(total_loaded, tb, other, total_margin)
 
 # Controls (filters UI) — same as 5.4.9
 if st.session_state.mode != 'edit':
     # --- Card: Calculation Parameters ---
     with st.container():
-        st.markdown(
-            "<div style='background-color:#111827; padding:16px 20px; "
-            "border-radius:10px; border:1px solid #1f2937;'>",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f"<div style=\"{CARD_STYLE}\">", unsafe_allow_html=True)
         st.markdown("### ⚙️ Calculation Parameters")
 
         c1, c2, c3, c4 = st.columns(4)
@@ -410,7 +493,6 @@ if st.session_state.mode != 'edit':
             st.number_input(
                 "Total Budget (mln ₽)",
                 min_value=0.0,
-                value=float(st.session_state.get("total_budget_cache", 240.0)),
                 step=10.0,
                 key="total_budget_cache",
                 on_change=mark_for_recalc,
@@ -418,30 +500,27 @@ if st.session_state.mode != 'edit':
         with c2:
             st.slider(
                 "α — Agency Profit Weight",
-                1.0,
-                2.5,
-                float(st.session_state.get("alpha_cache", 1.6)),
-                0.1,
+                min_value=1.0,
+                max_value=2.5,
+                step=0.1,
                 key="alpha_cache",
                 on_change=mark_for_recalc,
             )
         with c3:
             st.slider(
                 "β — Client Priority Weight",
-                0.5,
-                2.0,
-                float(st.session_state.get("beta_cache", 1.0)),
-                0.1,
+                min_value=0.5,
+                max_value=2.0,
+                step=0.1,
                 key="beta_cache",
                 on_change=mark_for_recalc,
             )
         with c4:
             st.slider(
                 "Free Float Share (%)",
-                0.0,
-                30.0,
-                float(st.session_state.get("other_share_cache", 10.0)),
-                1.0,
+                min_value=0.0,
+                max_value=30.0,
+                step=1.0,
                 key="other_share_cache",
                 on_change=mark_for_recalc,
             )
@@ -455,11 +534,7 @@ if st.session_state.mode != 'edit':
     # --- Card: Optional Parameters (by toggle) ---
     if st.session_state.get("show_optional_params", False):
         with st.container():
-            st.markdown(
-                "<div style='background-color:#111827; padding:16px 20px; "
-                "border-radius:10px; border:1px solid #1f2937;'>",
-                unsafe_allow_html=True,
-            )
+            st.markdown(f"<div style=\"{CARD_STYLE}\">", unsafe_allow_html=True)
 
             st.markdown("### ⚙️ Optional Parameters")
 
@@ -477,14 +552,12 @@ if st.session_state.mode != 'edit':
                     st.number_input(
                         "min (mln ₽)",
                         key=min_k,
-                        value=float(st.session_state.get(min_k, 0.0)),
                         step=10.0,
                         on_change=mark_for_recalc,
                     )
                     st.number_input(
                         "max (mln ₽)",
                         key=max_k,
-                        value=float(st.session_state.get(max_k, 0.0)),
                         step=10.0,
                         on_change=mark_for_recalc,
                     )
@@ -549,8 +622,6 @@ if st.session_state.mode != 'edit':
             )
 
             st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown('---')
 if st.session_state.mode == 'filters':
     a,b = st.columns(2)
     with a:
@@ -570,9 +641,11 @@ elif st.session_state.mode == 'result':
     else:
         total_loaded = float(pd.to_numeric(seriesize(df_result.get('recommended budget'), len(df_result)), errors='coerce').fillna(0).sum())
         tb = float(st.session_state.get('total_budget_cache', total_loaded))
-        pct = (total_loaded/tb*100.0) if tb>0 else 100.0
         other = float(st.session_state.get('other_share_cache', 10.0))
-        st.success(f"✅ Бюджет успешно распределён: {total_loaded:.2f} млн ₽ ({pct:.0f}%), Free Float Share ({other:.0f}%)")
+        remember_status_banners(total_loaded, tb, other, total_margin)
+        status_msg = st.session_state.get('last_summary_message')
+        if status_msg:
+            st.success(status_msg)
 
         st.subheader('📈 Recommended Split by Placement')
         base_cols = ['placement','category','recommended budget']
@@ -581,7 +654,9 @@ elif st.session_state.mode == 'result':
         table_df = df_result[base_cols + all_adv].copy()
         # Не показываем чисто служебные строки Free Float в UI по плейсментам
         if 'placement' in table_df.columns and 'category' in table_df.columns:
-            mask_ff = table_df['category'].astype(str).str.lower().eq('other') & table_df['placement'].astype(str).str.strip().str.lower().isin(['free float','free_float','свободно'])
+            cat_norm = table_df['category'].astype(str).map(normalize_category_key)
+            plc_norm = table_df['placement'].astype(str).str.strip().str.lower()
+            mask_ff = cat_norm.eq('other') & plc_norm.isin(['free float','free_float','свободно'])
             table_df = table_df[~mask_ff].copy()
         total_row = {c:'' for c in table_df.columns}
         total_row['placement'] = 'ИТОГО'; total_row['recommended budget']=pd.to_numeric(table_df['recommended budget'], errors='coerce').fillna(0).sum()
@@ -608,7 +683,8 @@ elif st.session_state.mode == 'result':
             sum_df = pd.concat([sum_df, pd.DataFrame([tot])], ignore_index=True)
             st.dataframe(sum_df.round(2), use_container_width=True)
 
-        st.markdown(f"### 💰 Общая маржинальность сплита: **{float(total_margin):.2f}%**")
+        margin_msg = st.session_state.get('last_margin_message', format_margin_message(total_margin))
+        st.markdown(margin_msg)
 
         ccsv, cxlsx = st.columns(2)
         with ccsv: st.download_button('💾 Download Results (CSV)', data=export_csv(df_result), file_name='split_by_placement.csv', mime='text/csv')
@@ -622,7 +698,6 @@ elif st.session_state.mode == 'edit':
     src_flag = st.session_state.get('edit_source'); waiting_for_file = (src_flag=='upload' and uploaded is None)
 
     base_df = st.session_state.get('base_df'); current_df = st.session_state.get('df_result')
-    margin_box = st.empty()  # single place to render margin
 
     def _restore_cat_order_from_meta(meta_df):
         """Восстанавливаем выбор категорий из _meta.selected_categories.
@@ -696,7 +771,7 @@ elif st.session_state.mode == 'edit':
             st.info(f"📥 Бюджет успешно подгружен: {total_loaded:.2f} млн ₽ ({pct:.0f}%), Free Float Share ({other:.0f}%)")
 
             # correct margin from uploaded file (with CP merged from catalog)
-            margin_box.markdown(f"### 💰 Общая маржинальность сплита: **{margin_from_current_budgets(base_df):.2f}%**")
+            st.session_state['last_margin_message'] = format_margin_message(margin_from_current_budgets(base_df))
 
             base_df = apply_category_priorities(base_df, get_selected_ui_groups())
             st.session_state.base_df = base_df.copy()
@@ -730,6 +805,10 @@ elif st.session_state.mode == 'edit':
                             column_config={'recommended budget': st.column_config.NumberColumn('recommended budget', format='%.6f')},
                             key='editor_table_v550')
 
+    status_placeholder = st.empty()
+    margin_placeholder = st.empty()
+    status_rendered = False
+
     c1,c2 = st.columns(2)
     with c1:
         if st.button('🔄 Save & Recalculate'):
@@ -757,16 +836,29 @@ elif st.session_state.mode == 'edit':
 
             total_loaded = float(pd.to_numeric(seriesize(df_res.get('recommended budget'), len(df_res)), errors='coerce').fillna(0).sum())
             tb = float(st.session_state.get('total_budget_cache', total_loaded))
-            pct = (total_loaded/tb*100.0) if tb>0 else 100.0
             other = float(st.session_state.get('other_share_cache', 10.0))
-            st.success(f"✅ Бюджет успешно распределён: {total_loaded:.2f} млн ₽ ({pct:.0f}%), Free Float Share ({other:.0f}%)")
-            margin_box.markdown(f"### 💰 Общая маржинальность сплита: **{float(total_margin):.2f}%**")
+            remember_status_banners(total_loaded, tb, other, total_margin)
+            msg = st.session_state.get('last_summary_message')
+            if msg:
+                status_placeholder.success(msg)
+            margin_msg = st.session_state.get('last_margin_message')
+            if margin_msg:
+                margin_placeholder.markdown(margin_msg)
+            status_rendered = True
     with c2:
         if st.button('⬅️ Back'):
             origin = st.session_state.get('edit_source')
             st.session_state['edit_source']=None
             st.session_state.mode = 'result' if origin!='upload' else 'filters'
             st.rerun()
+
+    if not status_rendered:
+        msg = st.session_state.get('last_summary_message')
+        if msg:
+            status_placeholder.success(msg)
+        margin_msg = st.session_state.get('last_margin_message')
+        if margin_msg:
+            margin_placeholder.markdown(margin_msg)
 
     cur_df = st.session_state.get('df_result'); cur_sum = st.session_state.get('summary')
     if cur_df is not None and cur_sum is not None:
