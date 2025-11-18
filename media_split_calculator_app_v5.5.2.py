@@ -37,16 +37,25 @@ def ensure_mode():
     st.session_state.setdefault('cat_level1', [])
     st.session_state.setdefault('cat_level2', [])
     st.session_state.setdefault('cat_level3', [])
+    st.session_state.setdefault('bl_selected', [])
     st.session_state.setdefault('total_budget_cache', 240.0)
     st.session_state.setdefault('alpha_cache', 1.6)
     st.session_state.setdefault('beta_cache', 1.0)
     st.session_state.setdefault('other_share_cache', 10.0)
     for key in ['y_min','y_max','da_min','da_max','vk_min','vk_max','mts_min','mts_max']:
         st.session_state.setdefault(key, 0.0)
+    st.session_state.setdefault('platform_bounds', {
+        'yandex': {'min': 0.0, 'max': 0.0},
+        'da': {'min': 0.0, 'max': 0.0},
+        'vk': {'min': 0.0, 'max': 0.0},
+        'mts': {'min': 0.0, 'max': 0.0},
+    })
     st.session_state.setdefault('last_summary_message', None)
     st.session_state.setdefault('last_margin_message', None)
     st.session_state.setdefault('edit_banner_text', None)
     st.session_state.setdefault('edit_banner_type', 'info')
+    st.session_state.setdefault('edited_df', None)
+    st.session_state.setdefault('calculated_df', None)
 
 def ensure_stable_ids(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -111,14 +120,16 @@ CARD_STYLE = (
 
 def render_card(title, body_fn):
     """Draw a card with shared style and render body_fn inside."""
-    card = st.container()
-    card.markdown("<div class='msc-card'>", unsafe_allow_html=True)
-    if title:
-        card.markdown(f"<h3 class='msc-card__title'>{title}</h3>", unsafe_allow_html=True)
-    inner = card.container()
-    with inner:
+    with st.container():
+        st.markdown("<div class='msc-card'>", unsafe_allow_html=True)
+        if title:
+            st.markdown(f"<h3 class='msc-card__title'>{title}</h3>", unsafe_allow_html=True)
         body_fn()
-    card.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+def toggle_optional_panel():
+    st.session_state['show_optional_params'] = not st.session_state.get('show_optional_params', False)
 
 
 def normalize_category_key(value) -> str:
@@ -584,6 +595,7 @@ def do_recalc():
         df_res['_ord'] = df_res['category'].astype(str).map(normalize_category_key).map(order_map).fillna(1e6)
         df_res = df_res.sort_values(by=['_ord','recommended budget'], ascending=[True, False]).drop(columns=['_ord'])
     st.session_state.df_result = df_res.copy()
+    st.session_state.calculated_df = df_res.copy()
     st.session_state.summary = summary.copy()
     st.session_state.total_margin = float(total_margin)
     st.session_state.base_df = ensure_stable_ids(df_res.copy())
@@ -634,16 +646,20 @@ if st.session_state.mode != 'edit':
                 on_change=mark_for_recalc,
             )
 
-    render_card("⚙️ Calculation Parameters", _render_calc_card)
+        btn_label = "⬆️ Hide Optional" if st.session_state.get("show_optional_params") else "⬇️ Optional"
+        st.button(
+            btn_label,
+            key="toggle_optional_btn",
+            use_container_width=True,
+            on_click=toggle_optional_panel,
+        )
 
-    # --- Toggle for Optional Parameters ---
-    if st.button("⬇️ Optional"):
-        st.session_state.show_optional_params = not st.session_state.get("show_optional_params", False)
+    render_card("⚙️ Calculation Parameters", _render_calc_card)
 
     # --- Card: Optional Parameters (by toggle) ---
     if st.session_state.get("show_optional_params", False):
         def _render_optional_card():
-            st.markdown("**Platform Budget (mln ₽, min/max) — optional**")
+            st.markdown("**Platform Budget (min/max)**")
             p1, p2, p3, p4 = st.columns(4)
             for label, min_k, max_k, col in [
                 ("Yandex", "y_min", "y_max", p1),
@@ -685,14 +701,13 @@ if st.session_state.mode != 'edit':
                 },
             }
 
-            st.markdown("**Category Priorities — optional**")
+            st.markdown("**Category Priorities (Priority 1/2/3 — multiselect)**")
             ui_groups = list(UI_GROUPS.keys())
             c_lvl1, c_lvl2, c_lvl3 = st.columns(3)
             with c_lvl1:
                 st.multiselect(
                     "Priority 1",
                     options=ui_groups,
-                    default=st.session_state.get("cat_level1", []),
                     key="cat_level1",
                     on_change=mark_for_recalc,
                 )
@@ -700,7 +715,6 @@ if st.session_state.mode != 'edit':
                 st.multiselect(
                     "Priority 2",
                     options=ui_groups,
-                    default=st.session_state.get("cat_level2", []),
                     key="cat_level2",
                     on_change=mark_for_recalc,
                 )
@@ -708,12 +722,11 @@ if st.session_state.mode != 'edit':
                 st.multiselect(
                     "Priority 3",
                     options=ui_groups,
-                    default=st.session_state.get("cat_level3", []),
                     key="cat_level3",
                     on_change=mark_for_recalc,
                 )
 
-            st.markdown("**Placements — Black List (optional)**")
+            st.markdown("**Black List (multiselect)**")
             plc_series = src_df["placement"].dropna().astype(str).map(lambda s: s.strip())
             all_plc = sorted(plc_series.unique().tolist())
             st.multiselect(
@@ -800,8 +813,6 @@ elif st.session_state.mode == 'edit':
     src_flag = st.session_state.get('edit_source'); waiting_for_file = (src_flag=='upload' and uploaded is None)
 
     base_df = st.session_state.get('base_df'); current_df = st.session_state.get('df_result')
-    banner_placeholder = st.empty()
-    margin_placeholder = st.empty()
 
     def _restore_cat_order_from_meta(meta_df):
         """Восстанавливаем выбор категорий из _meta.selected_categories.
@@ -915,29 +926,34 @@ elif st.session_state.mode == 'edit':
     if banner_text:
         banner_type = st.session_state.get('edit_banner_type', 'success')
         if banner_type == 'info':
-            banner_placeholder.info(banner_text)
+            st.info(banner_text)
         elif banner_type == 'warning':
-            banner_placeholder.warning(banner_text)
+            st.warning(banner_text)
         else:
-            banner_placeholder.success(banner_text)
-    margin_msg = st.session_state.get('last_margin_message')
-    if margin_msg:
-        margin_placeholder.markdown(margin_msg)
+            st.success(banner_text)
 
     edited = st.data_editor(editor_df, use_container_width=True, num_rows='fixed',
                             disabled=['__id','placement','category'],
                             column_config={'recommended budget': st.column_config.NumberColumn('recommended budget', format='%.6f')},
                             key='editor_table_v550')
+    st.session_state['edited_df'] = edited.copy()
+
+    margin_msg = st.session_state.get('last_margin_message')
+    if margin_msg:
+        st.markdown(margin_msg)
 
     c1,c2 = st.columns(2)
     with c1:
         if st.button('🔄 Save & Recalculate'):
+            edited_for_calc = st.session_state.get('edited_df')
+            if edited_for_calc is None:
+                edited_for_calc = edited.copy()
             base_rb = pd.to_numeric(seriesize(editor_df.get('recommended budget'), len(editor_df)), errors='coerce')
-            edited_rb = pd.to_numeric(seriesize(edited.get('recommended budget'), len(edited)), errors='coerce')
+            edited_rb = pd.to_numeric(seriesize(edited_for_calc.get('recommended budget'), len(edited_for_calc)), errors='coerce')
             manual_mask = (~edited_rb.isna()) & (base_rb.isna() | (np.abs(edited_rb - base_rb) > 1e-9))
-            locked_map = dict(zip(edited.loc[manual_mask, '__id'], edited_rb[manual_mask]))
+            locked_map = dict(zip(edited_for_calc.loc[manual_mask, '__id'], edited_rb[manual_mask]))
 
-            base_applied = apply_editor_to_base(base_df, edited, editable_cols)
+            base_applied = apply_editor_to_base(base_df, edited_for_calc, editable_cols)
             picked = get_selected_ui_groups()
             df_in, _ = filter_by_categories(base_applied, picked)
             # если после фильтрации категорий таблица пустая — берём базу целиком
@@ -956,6 +972,7 @@ elif st.session_state.mode == 'edit':
             )
             st.session_state.base_df = ensure_stable_ids(df_res.copy())
             st.session_state.df_result = df_res.copy()
+            st.session_state.calculated_df = df_res.copy()
             st.session_state.summary = summary.copy()
             st.session_state.total_margin = float(total_margin)
 
@@ -965,6 +982,8 @@ elif st.session_state.mode == 'edit':
             remember_status_banners(total_loaded, tb, other, total_margin)
             st.session_state['edit_banner_text'] = st.session_state.get('last_summary_message')
             st.session_state['edit_banner_type'] = 'success'
+            refreshed_cols = [c for c in show_cols if c in st.session_state.base_df.columns]
+            st.session_state['edited_df'] = st.session_state.base_df[refreshed_cols].copy()
     with c2:
         if st.button('⬅️ Back'):
             origin = st.session_state.get('edit_source')
@@ -973,7 +992,8 @@ elif st.session_state.mode == 'edit':
             st.session_state.mode = 'result' if origin!='upload' else 'filters'
             st.rerun()
 
-    cur_df = st.session_state.get('df_result'); cur_sum = st.session_state.get('summary')
+    cur_df = st.session_state.get('calculated_df') or st.session_state.get('df_result')
+    cur_sum = st.session_state.get('summary')
     if cur_df is not None and cur_sum is not None:
         d1,d2 = st.columns(2)
         with d1: st.download_button('💾 Download Result (CSV)', data=export_csv(cur_df), file_name='split_by_placement.csv', mime='text/csv')
