@@ -120,14 +120,16 @@ CARD_STYLE = (
 
 def render_card(title, body_fn):
     """Draw a card with shared style and render body_fn inside."""
-    card = st.container()
-    card.markdown("<div class='msc-card'>", unsafe_allow_html=True)
-    if title:
-        card.markdown(f"<h3 class='msc-card__title'>{title}</h3>", unsafe_allow_html=True)
-    inner = card.container()
-    with inner:
+    with st.container():
+        st.markdown("<div class='msc-card'>", unsafe_allow_html=True)
+        if title:
+            st.markdown(f"<h3 class='msc-card__title'>{title}</h3>", unsafe_allow_html=True)
         body_fn()
-    card.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+def toggle_optional_panel():
+    st.session_state['show_optional_params'] = not st.session_state.get('show_optional_params', False)
 
 
 def toggle_optional_panel():
