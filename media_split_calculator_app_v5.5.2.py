@@ -45,6 +45,8 @@ def ensure_mode():
         st.session_state.setdefault(key, 0.0)
     st.session_state.setdefault('last_summary_message', None)
     st.session_state.setdefault('last_margin_message', None)
+    st.session_state.setdefault('edit_banner_text', None)
+    st.session_state.setdefault('edit_banner_type', 'info')
 
 def ensure_stable_ids(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -105,6 +107,18 @@ CARD_STYLE = (
     "border-radius: 12px; border: 1px solid rgba(255,255,255,0.08); "
     "box-shadow: 0 8px 24px rgba(0,0,0,0.35);"
 )
+
+
+def render_card(title, body_fn):
+    """Draw a card with shared style and render body_fn inside."""
+    card = st.container()
+    card.markdown("<div class='msc-card'>", unsafe_allow_html=True)
+    if title:
+        card.markdown(f"<h3 class='msc-card__title'>{title}</h3>", unsafe_allow_html=True)
+    inner = card.container()
+    with inner:
+        body_fn()
+    card.markdown("</div>", unsafe_allow_html=True)
 
 
 def normalize_category_key(value) -> str:
@@ -328,6 +342,88 @@ def allocate_budget(df, total_budget=240.0, alpha=1.6, beta=1.0, other_share=10.
     st.session_state['last_meta_scale_coef'] = meta['scale_coef']
     return df_final, summary, float(total_margin), meta
 
+
+def allocate_with_manual_overrides(df, locked_budgets, total_budget, alpha, beta, other_share):
+    """Allocate budget while respecting manual overrides for specific placements."""
+    locked_budgets = {
+        np.int64(k): float(v)
+        for k, v in (locked_budgets or {}).items()
+        if v is not None and not pd.isna(v)
+    }
+    if not locked_budgets:
+        return allocate_budget(df, total_budget, alpha, beta, other_share, use_gates=None)
+
+    df = ensure_stable_ids(df)
+    order_map = {rid: idx for idx, rid in enumerate(df['__id'])}
+    mask_locked = df['__id'].isin(locked_budgets.keys())
+    locked_df = df[mask_locked].copy()
+    locked_df['recommended budget'] = locked_df['__id'].map(locked_budgets)
+    for aux in ['W', 'available']:
+        if aux not in locked_df.columns:
+            locked_df[aux] = np.nan
+
+    remaining_df = df[~mask_locked].copy()
+    total_budget = float(total_budget)
+    other_share = float(other_share)
+
+    locked_total = float(
+        pd.to_numeric(seriesize(locked_df.get('recommended budget'), len(locked_df)), errors='coerce').fillna(0).sum()
+    )
+    target_other_amount = total_budget * (other_share / 100.0)
+    locked_other_amount = 0.0
+    if not locked_df.empty and 'category' in locked_df.columns:
+        cat_norm = locked_df['category'].astype(str).map(normalize_category_key)
+        locked_other_amount = float(
+            pd.to_numeric(
+                seriesize(locked_df.loc[cat_norm == 'other', 'recommended budget'], len(locked_df)),
+                errors='coerce'
+            ).fillna(0).sum()
+        )
+
+    effective_total = max(total_budget - locked_total, 0.0)
+    remaining_other_amount = max(target_other_amount - locked_other_amount, 0.0)
+    if effective_total > 0:
+        remaining_other_amount = min(remaining_other_amount, effective_total)
+        effective_other_share = (remaining_other_amount / effective_total) * 100.0
+    else:
+        effective_other_share = 0.0
+
+    df_calc, _, _, meta = allocate_budget(
+        remaining_df,
+        total_budget=effective_total,
+        alpha=alpha,
+        beta=beta,
+        other_share=effective_other_share,
+        use_gates=None,
+    )
+    meta['locked_budget'] = locked_total
+    meta['locked_rows'] = len(locked_budgets)
+
+    df_result = pd.concat([locked_df, df_calc], ignore_index=True, sort=False)
+    if '__id' in df_result.columns:
+        df_result['_ord'] = df_result['__id'].map(order_map).fillna(1e6)
+        df_result = df_result.sort_values('_ord').drop(columns=['_ord'])
+
+    summary = df_result.groupby('category', as_index=False)['recommended budget'].sum()
+    actual_other_total = 0.0
+    if 'category' in summary.columns:
+        mask_other = summary['category'].astype(str).map(normalize_category_key) == 'other'
+        actual_other_total = float(summary.loc[mask_other, 'recommended budget'].sum())
+    summary = _ensure_other_summary(summary, actual_other_total if actual_other_total > 0 else None)
+    if total_budget > 0:
+        summary['share_%'] = (summary['recommended budget'] / total_budget) * 100.0
+    else:
+        summary['share_%'] = 0.0
+
+    df_valid = df_result[df_result['recommended budget'].fillna(0) > 0].copy()
+    if df_valid.empty:
+        total_margin = 0.0
+    else:
+        df_valid['contribution'] = df_valid['recommended budget'] * df_valid['commercial priority']
+        total_margin = (df_valid['contribution'].sum() / df_valid['recommended budget'].sum()) * 100.0
+
+    return df_result, summary, float(total_margin), meta
+
 def apply_editor_to_base(base_df, edited_df, editable_cols):
     base = base_df.copy()
     patch = edited_df[['__id', *editable_cols]].copy()
@@ -430,6 +526,22 @@ def margin_from_current_budgets(df) -> float:
 # ---- App ----
 st.set_page_config(page_title='📊 Media Split Calculator v5.5.2', layout='wide')
 st.title('📊 Media Split Calculator — v5.5.2')
+st.markdown(
+    f"""
+    <style>
+    .msc-card {{{CARD_STYLE} margin-bottom: 28px;}}
+    .msc-card__title {{
+        margin-top: 0;
+        margin-bottom: 1.25rem;
+        font-weight: 600;
+    }}
+    .msc-banner {{
+        margin-bottom: 0.75rem;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 FILE_PATH = 'калькулятор.xlsx'
 try:
     src_df = pd.read_excel(FILE_PATH)
@@ -484,10 +596,7 @@ def do_recalc():
 # Controls (filters UI) — same as 5.4.9
 if st.session_state.mode != 'edit':
     # --- Card: Calculation Parameters ---
-    with st.container():
-        st.markdown(f"<div style=\"{CARD_STYLE}\">", unsafe_allow_html=True)
-        st.markdown("### ⚙️ Calculation Parameters")
-
+    def _render_calc_card():
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             st.number_input(
@@ -525,7 +634,7 @@ if st.session_state.mode != 'edit':
                 on_change=mark_for_recalc,
             )
 
-        st.markdown("</div>", unsafe_allow_html=True)
+    render_card("⚙️ Calculation Parameters", _render_calc_card)
 
     # --- Toggle for Optional Parameters ---
     if st.button("⬇️ Optional"):
@@ -533,12 +642,7 @@ if st.session_state.mode != 'edit':
 
     # --- Card: Optional Parameters (by toggle) ---
     if st.session_state.get("show_optional_params", False):
-        with st.container():
-            st.markdown(f"<div style=\"{CARD_STYLE}\">", unsafe_allow_html=True)
-
-            st.markdown("### ⚙️ Optional Parameters")
-
-            # Platform Budget
+        def _render_optional_card():
             st.markdown("**Platform Budget (mln ₽, min/max) — optional**")
             p1, p2, p3, p4 = st.columns(4)
             for label, min_k, max_k, col in [
@@ -581,8 +685,6 @@ if st.session_state.mode != 'edit':
                 },
             }
 
-            
-            # Category Priorities — optional (three multiselect levels)
             st.markdown("**Category Priorities — optional**")
             ui_groups = list(UI_GROUPS.keys())
             c_lvl1, c_lvl2, c_lvl3 = st.columns(3)
@@ -610,7 +712,7 @@ if st.session_state.mode != 'edit':
                     key="cat_level3",
                     on_change=mark_for_recalc,
                 )
-# Placements — Black List
+
             st.markdown("**Placements — Black List (optional)**")
             plc_series = src_df["placement"].dropna().astype(str).map(lambda s: s.strip())
             all_plc = sorted(plc_series.unique().tolist())
@@ -621,7 +723,7 @@ if st.session_state.mode != 'edit':
                 on_change=mark_for_recalc,
             )
 
-            st.markdown("</div>", unsafe_allow_html=True)
+        render_card("⚙️ Optional Parameters", _render_optional_card)
 if st.session_state.mode == 'filters':
     a,b = st.columns(2)
     with a:
@@ -698,6 +800,8 @@ elif st.session_state.mode == 'edit':
     src_flag = st.session_state.get('edit_source'); waiting_for_file = (src_flag=='upload' and uploaded is None)
 
     base_df = st.session_state.get('base_df'); current_df = st.session_state.get('df_result')
+    banner_placeholder = st.empty()
+    margin_placeholder = st.empty()
 
     def _restore_cat_order_from_meta(meta_df):
         """Восстанавливаем выбор категорий из _meta.selected_categories.
@@ -768,7 +872,10 @@ elif st.session_state.mode == 'edit':
             if total_from_summary is not None and total_from_summary>0:
                 st.session_state['total_budget_cache'] = total_from_summary
 
-            st.info(f"📥 Бюджет успешно подгружен: {total_loaded:.2f} млн ₽ ({pct:.0f}%), Free Float Share ({other:.0f}%)")
+            st.session_state['edit_banner_text'] = (
+                f"📥 Бюджет успешно подгружен: {total_loaded:.2f} млн ₽ ({pct:.0f}%), Free Float Share ({other:.0f}%)"
+            )
+            st.session_state['edit_banner_type'] = 'info'
 
             # correct margin from uploaded file (with CP merged from catalog)
             st.session_state['last_margin_message'] = format_margin_message(margin_from_current_budgets(base_df))
@@ -800,18 +907,36 @@ elif st.session_state.mode == 'edit':
     show_cols = [c for c in show_cols if c in base_df.columns]
     editor_df = base_df[show_cols].copy()
 
+    if not st.session_state.get('edit_banner_text') and st.session_state.get('last_summary_message'):
+        st.session_state['edit_banner_text'] = st.session_state['last_summary_message']
+        st.session_state['edit_banner_type'] = 'success'
+
+    banner_text = st.session_state.get('edit_banner_text')
+    if banner_text:
+        banner_type = st.session_state.get('edit_banner_type', 'success')
+        if banner_type == 'info':
+            banner_placeholder.info(banner_text)
+        elif banner_type == 'warning':
+            banner_placeholder.warning(banner_text)
+        else:
+            banner_placeholder.success(banner_text)
+    margin_msg = st.session_state.get('last_margin_message')
+    if margin_msg:
+        margin_placeholder.markdown(margin_msg)
+
     edited = st.data_editor(editor_df, use_container_width=True, num_rows='fixed',
                             disabled=['__id','placement','category'],
                             column_config={'recommended budget': st.column_config.NumberColumn('recommended budget', format='%.6f')},
                             key='editor_table_v550')
 
-    status_placeholder = st.empty()
-    margin_placeholder = st.empty()
-    status_rendered = False
-
     c1,c2 = st.columns(2)
     with c1:
         if st.button('🔄 Save & Recalculate'):
+            base_rb = pd.to_numeric(seriesize(editor_df.get('recommended budget'), len(editor_df)), errors='coerce')
+            edited_rb = pd.to_numeric(seriesize(edited.get('recommended budget'), len(edited)), errors='coerce')
+            manual_mask = (~edited_rb.isna()) & (base_rb.isna() | (np.abs(edited_rb - base_rb) > 1e-9))
+            locked_map = dict(zip(edited.loc[manual_mask, '__id'], edited_rb[manual_mask]))
+
             base_applied = apply_editor_to_base(base_df, edited, editable_cols)
             picked = get_selected_ui_groups()
             df_in, _ = filter_by_categories(base_applied, picked)
@@ -821,15 +946,15 @@ elif st.session_state.mode == 'edit':
             df_in = apply_blacklist(df_in, st.session_state.get('bl_selected', []))
             df_in = apply_platform_bounds(df_in, st.session_state.get('platform_bounds', {}))
             df_in = apply_category_priorities(df_in, picked)
-            df_res, summary, total_margin, meta = allocate_budget(
+            df_res, summary, total_margin, meta = allocate_with_manual_overrides(
                 df_in,
+                locked_map,
                 total_budget=float(st.session_state.get('total_budget_cache', 240.0)),
                 alpha=float(st.session_state.get('alpha_cache', 1.6)),
                 beta=float(st.session_state.get('beta_cache', 1.0)),
                 other_share=float(st.session_state.get('other_share_cache', 10.0)),
-                use_gates=None
             )
-            st.session_state.base_df = base_applied.copy()
+            st.session_state.base_df = ensure_stable_ids(df_res.copy())
             st.session_state.df_result = df_res.copy()
             st.session_state.summary = summary.copy()
             st.session_state.total_margin = float(total_margin)
@@ -838,27 +963,15 @@ elif st.session_state.mode == 'edit':
             tb = float(st.session_state.get('total_budget_cache', total_loaded))
             other = float(st.session_state.get('other_share_cache', 10.0))
             remember_status_banners(total_loaded, tb, other, total_margin)
-            msg = st.session_state.get('last_summary_message')
-            if msg:
-                status_placeholder.success(msg)
-            margin_msg = st.session_state.get('last_margin_message')
-            if margin_msg:
-                margin_placeholder.markdown(margin_msg)
-            status_rendered = True
+            st.session_state['edit_banner_text'] = st.session_state.get('last_summary_message')
+            st.session_state['edit_banner_type'] = 'success'
     with c2:
         if st.button('⬅️ Back'):
             origin = st.session_state.get('edit_source')
             st.session_state['edit_source']=None
+            st.session_state['edit_banner_text'] = None
             st.session_state.mode = 'result' if origin!='upload' else 'filters'
             st.rerun()
-
-    if not status_rendered:
-        msg = st.session_state.get('last_summary_message')
-        if msg:
-            status_placeholder.success(msg)
-        margin_msg = st.session_state.get('last_margin_message')
-        if margin_msg:
-            margin_placeholder.markdown(margin_msg)
 
     cur_df = st.session_state.get('df_result'); cur_sum = st.session_state.get('summary')
     if cur_df is not None and cur_sum is not None:
