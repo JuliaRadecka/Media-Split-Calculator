@@ -119,19 +119,48 @@ CARD_STYLE = (
 
 
 def render_card(title, body_fn):
-    """Draw a card with shared style and render body_fn inside."""
-    card = st.container()
-    card.markdown("<div class='msc-card'>", unsafe_allow_html=True)
-    if title:
-        card.markdown(f"<h3 class='msc-card__title'>{title}</h3>", unsafe_allow_html=True)
-    inner = card.container()
-    with inner:
+    """Draw a card using the shared CSS skin and render body_fn inside."""
+    with st.container():
+        if title:
+            st.markdown(f"<div class='msc-card__title'>{title}</div>", unsafe_allow_html=True)
         body_fn()
-    card.markdown("</div>", unsafe_allow_html=True)
 
 
 def toggle_optional_panel():
     st.session_state['show_optional_params'] = not st.session_state.get('show_optional_params', False)
+
+
+def _update_state_value(key, new_value, on_change=None):
+    prev = st.session_state.get(key)
+    if prev != new_value:
+        st.session_state[key] = new_value
+        if on_change:
+            on_change()
+
+
+def number_input_state(label, key, *, default=0.0, on_change=None, **kwargs):
+    current = float(st.session_state.get(key, default))
+    new_val = st.number_input(label, value=current, **kwargs)
+    if float(new_val) != current:
+        _update_state_value(key, float(new_val), on_change)
+    return float(new_val)
+
+
+def slider_state(label, key, *, default, on_change=None, **kwargs):
+    current = st.session_state.get(key, default)
+    new_val = st.slider(label, value=current, **kwargs)
+    if new_val != current:
+        _update_state_value(key, new_val, on_change)
+    return new_val
+
+
+def multiselect_state(label, key, *, options, on_change=None):
+    current = st.session_state.get(key, []) or []
+    valid_current = [opt for opt in current if opt in options]
+    new_val = st.multiselect(label, options=options, default=valid_current)
+    if new_val != valid_current or len(current) != len(valid_current):
+        _update_state_value(key, new_val, on_change)
+    return new_val
 
 
 def normalize_category_key(value) -> str:
@@ -449,6 +478,19 @@ def apply_editor_to_base(base_df, edited_df, editable_cols):
     return merged
 
 
+def filter_real_placements(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove technical Free Float/OTHER rows from edit view."""
+    if df is None or not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    if df.empty or 'category' not in df or 'placement' not in df:
+        return df.copy()
+    df = df.copy()
+    cat_norm = df['category'].astype(str).map(normalize_category_key)
+    plc_norm = df['placement'].astype(str).str.strip().str.lower()
+    mask_free = cat_norm.eq('other') | plc_norm.isin(['free float', 'free_float', 'свободно'])
+    return df[~mask_free].copy()
+
+
 def apply_category_priorities(df, picked_ui_groups):
     """
     Присваиваем числовой приоритет категориям в зависимости от уровня:
@@ -542,15 +584,22 @@ st.title('📊 Media Split Calculator — v5.5.2')
 st.markdown(
     f"""
     <style>
-    .msc-card {{{CARD_STYLE} margin-bottom: 28px;}}
+    div[data-testid="stVerticalBlock"]:has(> .msc-card__title) {{{CARD_STYLE} margin-bottom: 28px; width: 100%;}}
     .msc-card__title {{
-        margin-top: 0;
+        margin: 0;
         margin-bottom: 1.25rem;
         font-weight: 600;
+        font-size: 1.25rem;
     }}
     .msc-banner {{
         margin-bottom: 0.75rem;
     }}
+    div[data-testid="stButton"]:has(+ .msc-optional-marker) button {{
+        width: 100%;
+        min-height: 3rem;
+        font-weight: 600;
+    }}
+    .msc-optional-marker {{display: none;}}
     </style>
     """,
     unsafe_allow_html=True,
@@ -613,38 +662,42 @@ if st.session_state.mode != 'edit':
     def _render_calc_card():
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            st.number_input(
+            number_input_state(
                 "Total Budget (mln ₽)",
+                "total_budget_cache",
                 min_value=0.0,
                 step=10.0,
-                key="total_budget_cache",
+                default=240.0,
                 on_change=mark_for_recalc,
             )
         with c2:
-            st.slider(
+            slider_state(
                 "α — Agency Profit Weight",
+                "alpha_cache",
                 min_value=1.0,
                 max_value=2.5,
                 step=0.1,
-                key="alpha_cache",
+                default=1.6,
                 on_change=mark_for_recalc,
             )
         with c3:
-            st.slider(
+            slider_state(
                 "β — Client Priority Weight",
+                "beta_cache",
                 min_value=0.5,
                 max_value=2.0,
                 step=0.1,
-                key="beta_cache",
+                default=1.0,
                 on_change=mark_for_recalc,
             )
         with c4:
-            st.slider(
+            slider_state(
                 "Free Float Share (%)",
+                "other_share_cache",
                 min_value=0.0,
                 max_value=30.0,
                 step=1.0,
-                key="other_share_cache",
+                default=10.0,
                 on_change=mark_for_recalc,
             )
 
@@ -655,6 +708,7 @@ if st.session_state.mode != 'edit':
             use_container_width=True,
             on_click=toggle_optional_panel,
         )
+        st.markdown("<span class='msc-optional-marker'></span>", unsafe_allow_html=True)
 
     render_card("⚙️ Calculation Parameters", _render_calc_card)
 
@@ -671,16 +725,18 @@ if st.session_state.mode != 'edit':
             ]:
                 with col:
                     st.caption(label)
-                    st.number_input(
+                    number_input_state(
                         "min (mln ₽)",
-                        key=min_k,
+                        min_k,
                         step=10.0,
+                        default=0.0,
                         on_change=mark_for_recalc,
                     )
-                    st.number_input(
+                    number_input_state(
                         "max (mln ₽)",
-                        key=max_k,
+                        max_k,
                         step=10.0,
+                        default=0.0,
                         on_change=mark_for_recalc,
                     )
 
@@ -707,34 +763,34 @@ if st.session_state.mode != 'edit':
             ui_groups = list(UI_GROUPS.keys())
             c_lvl1, c_lvl2, c_lvl3 = st.columns(3)
             with c_lvl1:
-                st.multiselect(
+                multiselect_state(
                     "Priority 1",
+                    "cat_level1",
                     options=ui_groups,
-                    key="cat_level1",
                     on_change=mark_for_recalc,
                 )
             with c_lvl2:
-                st.multiselect(
+                multiselect_state(
                     "Priority 2",
+                    "cat_level2",
                     options=ui_groups,
-                    key="cat_level2",
                     on_change=mark_for_recalc,
                 )
             with c_lvl3:
-                st.multiselect(
+                multiselect_state(
                     "Priority 3",
+                    "cat_level3",
                     options=ui_groups,
-                    key="cat_level3",
                     on_change=mark_for_recalc,
                 )
 
             st.markdown("**Black List (multiselect)**")
             plc_series = src_df["placement"].dropna().astype(str).map(lambda s: s.strip())
             all_plc = sorted(plc_series.unique().tolist())
-            st.multiselect(
+            multiselect_state(
                 "Exclude placements from calculation",
+                "bl_selected",
                 options=all_plc,
-                key="bl_selected",
                 on_change=mark_for_recalc,
             )
 
@@ -804,8 +860,8 @@ elif st.session_state.mode == 'result':
         st.markdown(margin_msg)
 
         ccsv, cxlsx = st.columns(2)
-        with ccsv: st.download_button('💾 Download Results (CSV)', data=export_csv(df_result), file_name='split_by_placement.csv', mime='text/csv')
-        with cxlsx: st.download_button('💾 Download Results (.xlsx)', data=export_excel(df_result, st.session_state.get('summary', pd.DataFrame()), st.session_state.base_df),
+        with ccsv: st.download_button('💾 Download CSV', data=export_csv(df_result), file_name='split_by_placement.csv', mime='text/csv')
+        with cxlsx: st.download_button('💾 Download XLSX', data=export_excel(df_result, st.session_state.get('summary', pd.DataFrame()), st.session_state.base_df),
                                        file_name='media_split_results.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         if st.button('✏️ Edit Calculated Table'): st.session_state.mode='edit'; st.rerun()
 
@@ -917,8 +973,9 @@ elif st.session_state.mode == 'edit':
 
     editable_cols = ['category priority','placement priority','minimum spend','maximum spend','recommended budget']
     show_cols = ['__id','placement','category', *editable_cols]
-    show_cols = [c for c in show_cols if c in base_df.columns]
-    editor_df = base_df[show_cols].copy()
+    editor_source = filter_real_placements(base_df)
+    show_cols = [c for c in show_cols if c in editor_source.columns]
+    editor_df = editor_source[show_cols].copy()
 
     if not st.session_state.get('edit_banner_text') and st.session_state.get('last_summary_message'):
         st.session_state['edit_banner_text'] = st.session_state['last_summary_message']
@@ -964,6 +1021,11 @@ elif st.session_state.mode == 'edit':
             df_in = apply_blacklist(df_in, st.session_state.get('bl_selected', []))
             df_in = apply_platform_bounds(df_in, st.session_state.get('platform_bounds', {}))
             df_in = apply_category_priorities(df_in, picked)
+            df_in = ensure_stable_ids(df_in)
+            if '__id' in df_in.columns and 'recommended budget' in df_in.columns:
+                unlocked_mask = ~df_in['__id'].isin(locked_map.keys())
+                if unlocked_mask.any():
+                    df_in.loc[unlocked_mask, 'recommended budget'] = np.nan
             df_res, summary, total_margin, meta = allocate_with_manual_overrides(
                 df_in,
                 locked_map,
@@ -984,8 +1046,9 @@ elif st.session_state.mode == 'edit':
             remember_status_banners(total_loaded, tb, other, total_margin)
             st.session_state['edit_banner_text'] = st.session_state.get('last_summary_message')
             st.session_state['edit_banner_type'] = 'success'
-            refreshed_cols = [c for c in show_cols if c in st.session_state.base_df.columns]
-            st.session_state['edited_df'] = st.session_state.base_df[refreshed_cols].copy()
+            refreshed_view = filter_real_placements(st.session_state.base_df)
+            refreshed_cols = [c for c in show_cols if c in refreshed_view.columns]
+            st.session_state['edited_df'] = refreshed_view[refreshed_cols].copy()
     with c2:
         if st.button('⬅️ Back'):
             origin = st.session_state.get('edit_source')
@@ -994,10 +1057,19 @@ elif st.session_state.mode == 'edit':
             st.session_state.mode = 'result' if origin!='upload' else 'filters'
             st.rerun()
 
-    cur_df = st.session_state.get('calculated_df') or st.session_state.get('df_result')
-    cur_sum = st.session_state.get('summary')
-    if cur_df is not None and cur_sum is not None:
+    export_df = st.session_state.get('calculated_df') or st.session_state.get('df_result')
+    if export_df is None:
+        export_df = st.session_state.get('edited_df') or editor_df
+    export_sum = st.session_state.get('summary')
+    if export_sum is None and export_df is not None and 'recommended budget' in export_df.columns:
+        export_sum = export_df.groupby('category', as_index=False)['recommended budget'].sum()
+    base_for_export = st.session_state.get('base_df')
+    if base_for_export is None and isinstance(export_df, pd.DataFrame):
+        base_for_export = ensure_stable_ids(export_df)
+    if export_df is not None and export_sum is not None and base_for_export is not None:
         d1,d2 = st.columns(2)
-        with d1: st.download_button('💾 Download Result (CSV)', data=export_csv(cur_df), file_name='split_by_placement.csv', mime='text/csv')
-        with d2: st.download_button('💾 Download Result (.xlsx)', data=export_excel(cur_df, cur_sum, st.session_state.base_df),
-                                    file_name='media_split_results_edited.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        with d1:
+            st.download_button('💾 Download CSV', data=export_csv(export_df), file_name='split_by_placement.csv', mime='text/csv')
+        with d2:
+            st.download_button('💾 Download XLSX', data=export_excel(export_df, export_sum, base_for_export),
+                                file_name='media_split_results_edited.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
